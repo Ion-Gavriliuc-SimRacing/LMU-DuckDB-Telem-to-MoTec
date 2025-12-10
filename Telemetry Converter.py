@@ -140,4 +140,338 @@ class DataLog(object):
             try:
                 t = float(values[0])
             except ValueError:
-                print(f"WARNING: Skipping line due to invalid
+                print(f"WARNING: Skipping line due to invalid timestamp: {line}")
+                continue
+                
+            for name, col_idx in channel_dict.items():
+                val_str = values[col_idx]
+                
+                # Handle missing/NaN values from interpolation
+                if not val_str or val_str.lower() in ('nan', 'none'):
+                    # If value is missing, flag channel for removal
+                    if name not in invalid_channels:
+                        invalid_channels.append(name)
+                    continue
+                
+                try:
+                    val = float(val_str)
+                    message = Message(t, val)
+                    self.channels[name].messages.append(message)
+                except ValueError:
+                    print(f"WARNING: Found non-numeric value '{val_str}' for channel {name} at time {t}. Channel will be removed.")
+                    if name not in invalid_channels:
+                        invalid_channels.append(name)
+
+        # Remove invalid channels
+        for name in invalid_channels:
+            if name in self.channels:
+                del self.channels[name]
+
+        # Remove channels with no data
+        channels_to_delete = [name for name, channel in self.channels.items() if not channel.messages]
+        for name in channels_to_delete:
+            print(f"WARNING: Channel {name} has no messages. Removing channel.")
+            del self.channels[name]
+
+
+class MotecLog(object):
+    """ Handles generating a MoTeC .ld file from log data. (from motec_log.py)"""
+    VEHICLE_PTR = 1762
+    VENUE_PTR = 5078
+    EVENT_PTR = 8180
+    HEADER_PTR = 11336
+    CHANNEL_HEADER_SIZE = struct.calcsize(ldChan.fmt)
+
+    def __init__(self):
+        # Default metadata fields
+        self.driver = "Automatic Conversion"
+        self.vehicle_id = "Telemetry Data"
+        self.vehicle_weight = 0
+        self.vehicle_type = "CSV Enhanced"
+        self.vehicle_comment = "Converted from DuckDB via script"
+        self.venue_name = "Virtual Track"
+        self.event_name = "Virtual Session"
+        self.event_session = "Q"
+        self.long_comment = ""
+        self.short_comment = ""
+        self.datetime = datetime.datetime.now()
+
+        self.ld_header = None
+        self.ld_channels = []
+
+    def initialize(self):
+        ld_vehicle = ldVehicle(self.vehicle_id, self.vehicle_weight, self.vehicle_type, self.vehicle_comment)
+        ld_venue = ldVenue(self.venue_name, self.VEHICLE_PTR, ld_vehicle)
+        ld_event = ldEvent(self.event_name, self.event_session, self.long_comment, self.VENUE_PTR, ld_venue)
+
+        self.ld_header = ldHead(self.HEADER_PTR, self.HEADER_PTR, self.EVENT_PTR, ld_event, self.driver, self.vehicle_id, self.venue_name, self.datetime, self.short_comment, self.event_name, self.event_session)
+
+    def add_channel(self, log_channel):
+        """ Adds a single channel of data to the motec log. """
+        if not log_channel.messages:
+            return
+
+        self.ld_header.data_ptr += self.CHANNEL_HEADER_SIZE
+
+        for ld_channel in self.ld_channels:
+            ld_channel.data_ptr += self.CHANNEL_HEADER_SIZE
+
+        if self.ld_channels:
+            meta_ptr = self.ld_channels[-1].next_meta_ptr
+            prev_meta_ptr = self.ld_channels[-1].meta_ptr
+            data_ptr = self.ld_channels[-1].data_ptr + self.ld_channels[-1]._data.nbytes
+        else:
+            meta_ptr = self.HEADER_PTR
+            prev_meta_ptr = 0
+            data_ptr = self.ld_header.data_ptr
+        next_meta_ptr = meta_ptr + self.CHANNEL_HEADER_SIZE
+
+        data_len = len(log_channel.messages)
+        data_type = np.float32 if log_channel.data_type is float else np.int32
+        
+        # Calculate frequency from the constant time step (should be 100Hz from resampling)
+        freq = 1.0 / (log_channel.messages[1].timestamp - log_channel.messages[0].timestamp) if len(log_channel.messages) > 1 else 10.0
+        
+        ld_channel = ldChan(None, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len, \
+            data_type, int(round(freq)), 0, 1, 1, 0, log_channel.name, "", log_channel.units)
+        
+        # Add channel data
+        ld_channel._data = np.array([msg.value for msg in log_channel.messages], dtype=data_type)
+
+        self.ld_channels.append(ld_channel)
+
+    def add_all_channels(self, data_log):
+        """ Adds all channels from a DataLog to the motec log. """
+        for _, channel in data_log.channels.items():
+            self.add_channel(channel)
+
+    def write(self, filename):
+        """ Writes the motec log data to disc. """
+        if self.ld_channels:
+            ld_data = ldData(self.ld_header, self.ld_channels)
+            ld_data.channs[-1].next_meta_ptr = 0
+            ld_data.write(filename)
+        else:
+            with open(filename, "wb") as f:
+                self.ld_header.write(f, 0)
+            print("WARNING: MoTeC log created but no channels were found.")
+
+# ====================================================================
+# SECTION 2: DUCKDB PRE-PROCESSING LOGIC (User's script logic)
+# ====================================================================
+
+def get_frequency(df_channels_list, channel_name_in_list):
+    freq = df_channels_list[df_channels_list['channelName'] == channel_name_in_list]['frequency']
+    if not freq.empty:
+        return freq.iloc[0]
+    # Fallback logic
+    if channel_name_in_list == 'Throttle Pos':
+        return get_frequency(df_channels_list, 'Brake Pos')
+    raise ValueError(f"Frequency not found for channel: {channel_name_in_list}")
+
+def resample_and_interpolate(
+    df_raw, df_channels_list, channel_name, value_col_name, master_time, freq=None, is_wheel_speed=False, is_gear=False
+):
+    df = df_raw.copy()
+    current_freq = freq
+    if not freq and not is_gear:
+        current_freq = get_frequency(df_channels_list, channel_name)
+
+    if is_gear:
+        df = df.rename(columns={'ts': 'time', 'value': value_col_name})
+        df = df.drop_duplicates(subset=['time'], keep='last')
+        df = df[['time', value_col_name]].set_index('time')
+    elif is_wheel_speed:
+        # Create time axis for raw data: t = index / freq
+        df['time'] = np.arange(len(df)) / current_freq
+        
+        # Conversion M/S -> KM/H (M/S * 3.6) and mean calculation
+        df[value_col_name] = df[['value1', 'value2', 'value3', 'value4']].mean(axis=1) * 3.6
+        
+        df = df[['time', value_col_name]].set_index('time')
+    else:
+        # Create time axis for raw data: t = index / freq
+        df['time'] = np.arange(len(df)) / current_freq
+        df = df.rename(columns={'value': value_col_name})
+        df = df[['time', value_col_name]].set_index('time')
+
+    # Reindex to master time axis
+    df_resampled = df.reindex(master_time.values)
+
+    # Apply interpolation
+    if is_gear:
+        # Gear uses Last-Point-Hold (ffill)
+        df_resampled[value_col_name] = df_resampled[value_col_name].ffill().bfill()
+    else:
+        # Other channels use linear interpolation
+        df_resampled[value_col_name] = df_resampled[value_col_name].interpolate(method='linear', limit_direction='both')
+
+    return df_resampled.reset_index()
+
+# ====================================================================
+# SECTION 3: WORKFLOW AND INTEGRATION
+# ====================================================================
+
+def process_and_convert_to_motec(duckdb_file_path):
+    """
+    Processes the DuckDB file, creates the intermediate CSV, and converts it to .ld.
+    """
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    base_name = os.path.splitext(os.path.basename(duckdb_file_path))[0]
+    
+    # 1. Define Output Paths in the 'Telemetry' folder
+    output_dir = os.path.join(script_dir, "Telemetry")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    output_csv_path = os.path.join(output_dir, f"{base_name}_telemetry_enhanced.csv")
+    output_ld_path = os.path.join(output_dir, f"{base_name}_telemetry.ld")
+
+    print(f"\n--- Starting Processing for: {base_name} ---")
+
+    try:
+        # --- (A) Extraction and Interpolation ---
+        con = duckdb.connect(database=duckdb_file_path, read_only=True)
+        df_channels_list = con.execute("SELECT * FROM channelsList;").fetchdf()
+
+        # Load raw data (Table names must match your DuckDB structure)
+        df_throttle_raw = con.execute("SELECT * FROM \"Throttle Pos\"").fetchdf()
+        df_brake_raw = con.execute("SELECT * FROM \"Brake Pos\"").fetchdf()
+        df_speed_raw = con.execute("SELECT * FROM \"Wheel Speed\"").fetchdf()
+        df_boost_raw = con.execute("SELECT * FROM \"Turbo Boost Pressure\"").fetchdf()
+        df_coolant_temp_raw = con.execute("SELECT * FROM \"Engine Water Temp\"").fetchdf()
+        df_rpm_raw = con.execute("SELECT * FROM \"Engine RPM\"").fetchdf()
+
+        # Get Frequencies and max times
+        freq_throttle = get_frequency(df_channels_list, 'Throttle Pos')
+        freq_brake = get_frequency(df_channels_list, 'Brake Pos')
+        freq_speed = get_frequency(df_channels_list, 'Wheel Speed')
+        freq_boost = get_frequency(df_channels_list, 'Turbo Boost Pressure')
+        freq_coolant_temp = get_frequency(df_channels_list, 'Engine Water Temp')
+        freq_rpm = get_frequency(df_channels_list, 'Engine RPM')
+
+        max_time_throttle = (len(df_throttle_raw) - 1) / freq_throttle if len(df_throttle_raw) > 0 else 0
+        max_time_brake = (len(df_brake_raw) - 1) / freq_brake if len(df_brake_raw) > 0 else 0
+        max_time_speed = (len(df_speed_raw) - 1) / freq_speed if len(df_speed_raw) > 0 else 0
+        max_time_boost = (len(df_boost_raw) - 1) / freq_boost if len(df_boost_raw) > 0 else 0
+        max_time_coolant_temp = (len(df_coolant_temp_raw) - 1) / freq_coolant_temp if len(df_coolant_temp_raw) > 0 else 0
+        max_time_rpm = (len(df_rpm_raw) - 1) / freq_rpm if len(df_rpm_raw) > 0 else 0
+            
+        session_end_time = np.max([
+            max_time_throttle, max_time_brake, max_time_speed, max_time_boost,
+            max_time_coolant_temp, max_time_rpm
+        ])
+
+        # Master time axis (Target 100 Hz = 0.01s step)
+        MASTER_FREQ = 100.0
+        master_time_step = 1.0 / MASTER_FREQ
+        master_time = pd.Series(np.arange(0, session_end_time + master_time_step, master_time_step), name='time')
+
+        print(f"Resampling and interpolating data to {MASTER_FREQ} Hz...")
+        
+        # Resample and Interpolate
+        df_throttle = resample_and_interpolate(df_throttle_raw, df_channels_list, 'Throttle Pos', 'Throttle_Pos', master_time, freq_throttle)
+        df_brake = resample_and_interpolate(df_brake_raw, df_channels_list, 'Brake Pos', 'Brake_Pos', master_time, freq_brake)
+        df_speed = resample_and_interpolate(df_speed_raw, df_channels_list, 'Wheel Speed', 'Speed_KPH', master_time, freq_speed, is_wheel_speed=True)
+        df_boost = resample_and_interpolate(df_boost_raw, df_channels_list, 'Turbo Boost Pressure', 'Boost_Pressure', master_time, freq_boost)
+        df_coolant_temp = resample_and_interpolate(df_coolant_temp_raw, df_channels_list, 'Engine Water Temp', 'Coolant_Temp', master_time, freq_coolant_temp)
+        df_rpm = resample_and_interpolate(df_rpm_raw, df_channels_list, 'Engine RPM', 'Engine_RPM', master_time, freq_rpm)
+
+        # Handle optional 'Gear' channel
+        df_gear_raw = pd.DataFrame({'ts': [], 'value': []})
+        try:
+            df_gear_raw = con.execute("SELECT * FROM \"Gear\"").fetchdf()
+            df_gear = resample_and_interpolate(df_gear_raw, df_channels_list, 'Gear', 'Gear_Position', master_time, is_gear=True)
+        except duckdb.CatalogException:
+            print("WARNING: 'Gear' table not found in DuckDB. Channel will be excluded.")
+            df_gear = pd.DataFrame({'time': master_time.values, 'Gear_Position': np.nan})
+        
+        # Merge all dataframes
+        df_telemetry_enhanced = pd.DataFrame({'time': master_time})
+        df_telemetry_enhanced = pd.merge(df_telemetry_enhanced, df_throttle, on='time', how='left')
+        df_telemetry_enhanced = pd.merge(df_telemetry_enhanced, df_brake, on='time', how='left')
+        df_telemetry_enhanced = pd.merge(df_telemetry_enhanced, df_speed, on='time', how='left')
+        df_telemetry_enhanced = pd.merge(df_telemetry_enhanced, df_boost, on='time', how='left')
+        df_telemetry_enhanced = pd.merge(df_telemetry_enhanced, df_coolant_temp, on='time', how='left')
+        df_telemetry_enhanced = pd.merge(df_telemetry_enhanced, df_gear, on='time', how='left')
+        df_telemetry_enhanced = pd.merge(df_telemetry_enhanced, df_rpm, on='time', how='left')
+
+        con.close()
+        
+        # --- (B) Save Intermediate CSV ---
+        df_telemetry_enhanced.to_csv(output_csv_path, index=False)
+        print(f"Processed telemetry data saved to intermediate CSV: '{output_csv_path}'")
+        
+        # --- (C) MoTeC (.ld) Conversion ---
+        print("\n--- Converting to MoTeC (.ld) format ---")
+        
+        # Load the newly created CSV as input for MoTeC log generation
+        with open(output_csv_path, "r") as file:
+            csv_lines = file.readlines()
+
+        data_log = DataLog()
+        
+        # Use the adapted from_csv_log to interpret the enhanced CSV and apply MoTeC metadata
+        data_log.from_csv_log(csv_lines)
+
+        if not data_log.channels:
+            print("ERROR: Failed to find any channels in the processed log data. MoTeC conversion aborted.")
+            try: os.remove(output_csv_path)
+            except OSError: pass
+            sys.exit(1)
+
+        # Initialize and populate the MoTeC log
+        motec_log = MotecLog()
+        motec_log.initialize()
+        motec_log.add_all_channels(data_log)
+
+        # Write the .ld file
+        print("Saving MoTeC log...")
+        motec_log.write(output_ld_path)
+        print(f"SUCCESS: MoTeC (.ld) file saved to: '{output_ld_path}'")
+
+        # --- NEW STEP: Cleanup ---
+        try:
+            os.remove(output_csv_path)
+            print(f"Cleanup: Intermediate CSV file removed: '{output_csv_path}'")
+        except OSError as e:
+            print(f"WARNING: Could not remove intermediate CSV file: {e}")
+            
+    except FileNotFoundError:
+        print(f"ERROR: File not found at '{duckdb_file_path}'")
+        sys.exit(1)
+    except duckdb.CatalogException as e:
+        print(f"ERROR querying DuckDB tables (table name mismatch?): {e}")
+        sys.exit(1)
+    except ValueError as e:
+        print(f"ERROR in data processing: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        sys.exit(1)
+
+def select_and_process_file():
+    """ Handles file selection via GUI or manual input. """
+    duckdb_file_path = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        print("Please select your DuckDB file (.duckdb) using the GUI dialog...")
+        duckdb_file_path = filedialog.askopenfilename(
+            title="Select DuckDB File",
+            filetypes=[("DuckDB files", "*.duckdb"), ("All files", "*.*")]
+        )
+    except tk.TclError:
+        print("\nTkinter GUI is not available. Please manually enter the path to your DuckDB file:")
+        duckdb_file_path = input("DuckDB file path: ").strip()
+        if not duckdb_file_path:
+            print("No path entered. Operation cancelled.")
+            sys.exit(0)
+
+    if duckdb_file_path:
+        print(f"Selected file: {duckdb_file_path}")
+        process_and_convert_to_motec(duckdb_file_path)
+    else:
+        print("No file selected. Operation cancelled.")
+
+if __name__ == "__main__":
+    select_and_process_file()
