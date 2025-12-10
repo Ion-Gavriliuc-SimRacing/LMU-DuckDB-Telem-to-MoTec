@@ -35,3 +35,4 @@ To run the script, you must have **Python** installed on your system and all the
 Run Telemetry Converter.py, select the DuckDB telemetry file from your LMU Directory, wait for it to convert and you'll have your MoTec file saved in Telemetry folder
 
 For a complete step-by-step guide on how to use this script and convert your DuckDB file to a MoTeC log, watch the tutorial here:
+https://youtu.be/eBb9RyZ6TVU
